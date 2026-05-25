@@ -385,6 +385,16 @@ class BaseTrainer(ABC):
         logger.info(f"Batch size: {self.config.batch}")
         logger.info(f"Learning rate: {self.effective_lr}")
 
+
+        is_compiled = any(
+            type(m).__name__ == "OptimizedModule" or hasattr(m, "_orig_mod")
+            for m in self.model.modules()
+        )
+        if is_compiled:
+            logger.info("Execution Mode: COMPILED (Triton graph fusion, out-of-place forks active)")
+        else:
+            logger.info("Execution Mode: EAGER (Native Windows, in-place VRAM savers active)")
+
         start_time = time.time()
 
         for epoch in range(self.start_epoch, self.config.epochs):

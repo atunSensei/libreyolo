@@ -34,7 +34,7 @@ def preprocess_numpy(
     img_resized = Image.fromarray(img_rgb_hwc).resize(
         (input_size, input_size), Image.Resampling.BILINEAR
     )
-    arr = np.array(img_resized, dtype=np.float32) / 255.0
+    arr = np.array(img_resized, dtype=np.float32) * (1.0 / 255.0) # Multiply by reciprocal for better performance than division
     return arr.transpose(2, 0, 1), 1.0
 
 

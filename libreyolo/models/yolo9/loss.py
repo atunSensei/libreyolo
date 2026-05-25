@@ -14,7 +14,6 @@ from torch.nn import BCEWithLogitsLoss
 
 from libreyolo.utils.box_ops import compute_iou as calculate_iou
 
-
 def generate_anchors(
     image_size: List[int], strides: List[int]
 ) -> Tuple[Tensor, Tensor]:
@@ -97,7 +96,12 @@ class BoxLoss(nn.Module):
         picked_targets = targets_bbox[valid_masks] # shape: (N, 4)
 
         iou = calculate_iou(picked_predict, picked_targets, "ciou", pairwise=False)
-        loss_iou = 1.0 - iou
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        if torch.compiler.is_compiling():
+            loss_iou = 1.0 - iou
+        else:
+            # 1.0 - iou is mathematically identical to (iou * -1) + 1
+            loss_iou = iou.neg_().add_(1.0)
         loss_iou = (loss_iou * box_norm).sum() * (1.0 / cls_norm) # Changed to multiplication by reciprocal
         return loss_iou
 
@@ -271,12 +275,12 @@ class Vec2Box:
             pred_dist = F.softmax(pred_anc, dim=3)
             # Weighted sum: multiply by [0, 1, 2, ..., reg_max-1]
             
-            # --- HYBRID OPTIMIZATION: Lazy init cache for DFL projection ---
+            # Lazy init cache for DFL projection ---
             if self.proj is None or self.proj.dtype != pred_dist.dtype:
                 self.proj = torch.arange(
                     self.reg_max, dtype=pred_dist.dtype, device=device
                 )
-            pred_box = (pred_dist * self.proj.view(1, 1, 1, -1)).sum(dim=3)  # (B, H*W, 4)
+            pred_box = (pred_dist * self.proj.view(1, 1, 1, -1)).sum(dim=3) # (B, H*W, 4
             preds_box_list.append(pred_box)
 
         # Concatenate across scales
@@ -503,8 +507,16 @@ class BoxMatcher:
         # Compute task-aligned score
         # target_matrix = (iou_mat**self.iou_factor) * (cls_mat**self.cls_factor)
         # Use specific PyTorch .sqrt() functions when cls_factor is 0.5 for speed.
-        cls_score = cls_mat.sqrt() if self.cls_factor == 0.5 else cls_mat ** self.cls_factor
-        target_matrix = (iou_mat ** self.iou_factor) * cls_score
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        if torch.compiler.is_compiling():
+            cls_score = cls_mat.sqrt() if self.cls_factor == 0.5 else cls_mat ** self.cls_factor
+            target_matrix = (iou_mat ** self.iou_factor) * cls_score
+        else:
+            # cls_mat is not used again, modify in-place
+            cls_score = cls_mat.sqrt_() if self.cls_factor == 0.5 else cls_mat.pow_(self.cls_factor)
+            # Create target_matrix once via pow(), then multiply cls_score into it in-place
+            target_matrix = iou_mat.pow(self.iou_factor)
+            target_matrix.mul_(cls_score)
 
         # Select top-k anchors per target
         topk_mask = self.filter_topk(
@@ -540,7 +552,12 @@ class BoxMatcher:
         # normalize_term = (target_matrix / (max_target + 1e-9)) * max_iou
         # Divide first, then do fast multiplication
         scaling_ratio = max_iou / (max_target + 1e-9)
-        normalize_term = target_matrix * scaling_ratio
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        if torch.compiler.is_compiling():
+            normalize_term = target_matrix * scaling_ratio
+        else:
+            # target_matrix is completely discarded after this, overwrite it
+            normalize_term = target_matrix.mul_(scaling_ratio)
 
         normalize_term = normalize_term.permute(0, 2, 1).gather(2, unique_indices)
         align_cls = align_cls * normalize_term * valid_mask[:, :, None]
@@ -563,6 +580,7 @@ class YOLO9Loss:
     - DFL loss (Distribution Focal Loss)
     - Classification loss (BCE)
     """
+    _logged_mode = False
 
     def __init__(
         self,
@@ -650,6 +668,7 @@ class YOLO9Loss:
             total_loss: Scalar loss tensor
             loss_dict: Dict with individual loss values for logging
         """
+
         if self.vec2box is None:
             raise RuntimeError("Vec2Box not initialized. Call update_anchors() first.")
 
@@ -743,7 +762,7 @@ class YOLO9Loss:
             "box_loss": loss_box_weighted,
             "dfl_loss": loss_dfl_weighted,
             "cls_loss": loss_cls_weighted,
-            # Pass raw tensors; trainer.py will safely call .item() outside the graph!
+            # Pass raw tensors. Avoid graph break from .item() calls. Logging code can handle tensor values.
             "box": loss_box_weighted,
             "dfl": loss_dfl_weighted,
             "cls": loss_cls_weighted,
