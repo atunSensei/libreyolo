@@ -135,7 +135,16 @@ class DFLoss(nn.Module):
         targets_dist = torch.cat(
             ((anchors_norm - bbox_lt), (bbox_rb - anchors_norm)), -1
         )
-        targets_dist = targets_dist.clamp(0, self.reg_max - 1.01)  # (B, anchors, 4). Reverting clamp_. Seems to make PyTorch compiler mad and worsens perf.
+
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        if torch.compiler.is_compiling():
+            # Graph-friendly (WSL2 / Linux)
+            targets_dist = targets_dist.clamp(0, self.reg_max - 1.01)
+        else:
+            # VRAM-saving in-place (Windows Eager Mode)
+            targets_dist.clamp_(0, self.reg_max - 1.01)
+
+        #targets_dist = targets_dist.clamp(0, self.reg_max - 1.01)  # (B, anchors, 4). Reverting clamp_. Seems to make PyTorch compiler mad and worsens perf.
 
         # Select valid targets: (B, anchors, 4)[mask] -> (num_valid, 4) -> flatten to (num_valid * 4,)
         # picked_targets = targets_dist[valid_bbox].view(-1)
@@ -278,8 +287,13 @@ class Vec2Box:
         )  # (B, total_anchors, 4) - LTRB distances
 
         # Convert LTRB distances to xyxy coordinates (pixel space)
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        if torch.compiler.is_compiling():
+            pred_LTRB = preds_box * self.scaler.view(1, -1, 1)
+        else:
+            pred_LTRB = preds_box.mul_(self.scaler.view(1, -1, 1))
         # pred_box is in "grid units", scale by stride
-        pred_LTRB = preds_box * self.scaler.view(1, -1, 1)
+        #pred_LTRB = preds_box * self.scaler.view(1, -1, 1)
         lt, rb = pred_LTRB.chunk(2, dim=-1)
         preds_box = torch.cat([self.anchor_grid - lt, self.anchor_grid + rb], dim=-1)
 
@@ -335,8 +349,16 @@ class BoxMatcher:
         targets_dist = torch.stack(
             (x_min_dist, y_min_dist, x_max_dist, y_max_dist), dim=-1
         )
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        if torch.compiler.is_compiling():
+            # Out-of-place multiplication by reciprocal (Compiled)
+            targets_dist = targets_dist * (1.0 / self.scaler[None, None, :, None]) 
+        else:
+            # In-place division (Eager Mode)
+            targets_dist.div_(self.scaler[None, None, :, None])
+
         # Reverting in-place op. Seems to make Torch mad. Worse perf. Reciprocal mul is faster than div
-        targets_dist = targets_dist * (1.0 / self.scaler[None, None, :, None]) 
+        #targets_dist = targets_dist * (1.0 / self.scaler[None, None, :, None]) 
 
         min_reg_dist, max_reg_dist = (
             targets_dist.amin(dim=-1),
@@ -365,6 +387,7 @@ class BoxMatcher:
         return cls_probabilities
 
     def get_iou_matrix(self, predict_bbox: Tensor, target_bbox: Tensor) -> Tensor:
+        iou = calculate_iou(target_bbox, predict_bbox, "ciou")
         """
         Compute IoU matrix between predictions and targets.
 
@@ -375,7 +398,12 @@ class BoxMatcher:
         Returns:
             IoU matrix [B, targets, anchors]
         """
-        return calculate_iou(target_bbox, predict_bbox, "ciou").clamp(0, 1) # Reverting in-place op. Seems to make Torch mad. Worse perf.
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        if torch.compiler.is_compiling():
+            return iou.clamp(0, 1)
+        else:
+            return iou.clamp_(0, 1)
+        #return calculate_iou(target_bbox, predict_bbox, "ciou").clamp(0, 1) # Reverting in-place op. Seems to make Torch mad. Worse perf.
 
     def filter_topk(
         self, target_matrix: Tensor, grid_mask: Tensor, topk: int = 10
@@ -454,7 +482,14 @@ class BoxMatcher:
             return anchor_matched_targets, valid_mask
 
         target_cls, target_bbox = target.split([1, 4], dim=-1)
-        target_cls = target_cls.long().clamp(0, self.num_classes - 1) # Reverting in-place op. Seems to make Torch mad. Worse perf.
+        # Compiler fork: Use best method depending on whether we're in compiled mode or eager mode to avoid graph breaks and maximize perf.
+        target_cls = target_cls.long()
+        if torch.compiler.is_compiling():
+            target_cls = target_cls.clamp(0, self.num_classes - 1)
+        else:
+            target_cls.clamp_(0, self.num_classes - 1)
+        
+        #target_cls = target_cls.long().clamp(0, self.num_classes - 1) # Reverting in-place op. Seems to make Torch mad. Worse perf.
 
         # Get valid matrix (which anchors can predict which targets)
         grid_mask = self.get_valid_matrix(target_bbox)
@@ -650,13 +685,18 @@ class YOLO9Loss:
         # Calculate reciprocal division once
         inv_scaler = 1.0 / self.vec2box.scaler
 
-        # Normalize predicted boxes to same scale as targets
-        preds_box_norm = preds_box * inv_scaler[None, :, None] # Changed to multiplication of reciprocal
-        targets_bbox_norm = targets_bbox * inv_scaler[None, :, None]
+        # Compiler Fork. Normalize predicted boxes to same scale as targets & compute norms
+        if torch.compiler.is_compiling():
+            # Out-of-place for pure compiled graph (WSL2)
+            preds_box_norm = preds_box * inv_scaler[None, :, None]
+            targets_bbox_norm = targets_bbox * inv_scaler[None, :, None]
+            cls_norm = targets_cls.sum().clamp(min=1.0)
+        else:
+            # In-place VRAM savers for eager mode (Windows)
+            preds_box_norm = preds_box.mul_(inv_scaler[None, :, None])
+            targets_bbox_norm = targets_bbox * inv_scaler[None, :, None]  # Must remain out-of-place (view)
+            cls_norm = targets_cls.sum().clamp_(min=1.0)
 
-        # Compute normalization factors
-        # cls_norm = max(targets_cls.sum(), 1)
-        cls_norm = targets_cls.sum().clamp(min=1.0) # Use clamp() to avoid torch graph break for perf.
         box_norm = targets_cls.sum(-1)[valid_masks]
 
         # Compute losses
